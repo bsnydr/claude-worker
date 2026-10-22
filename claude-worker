@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""claude-worker: run a bounded, subscription-authenticated Claude Code worker.
+
+Designed for a primary coding agent or script. Operational subcommands print one
+JSON object to stdout; --help prints ordinary help. Progress goes to stderr.
+See README.md for usage guidance.
+"""
+
+import argparse
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+SCHEMA = 1
+DEFAULT_CLAUDE = "/opt/homebrew/bin/claude"
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Web research and native subagents let one worker own a whole outcome instead of handing steps back to the caller.
+LEAD_TOOLS = ["WebSearch", "WebFetch", "Agent"]
+MODES = {
+    "text": {"tools": [], "permission_mode": "dontAsk"},
+    "read": {"tools": ["Read", "Glob", "Grep", *LEAD_TOOLS], "permission_mode": "dontAsk"},
+    "edit": {"tools": ["Read", "Glob", "Grep", "Edit", "Write", *LEAD_TOOLS], "permission_mode": "acceptEdits"},
+}
+AUTH_FIELDS = ("loggedIn", "authMethod", "apiProvider", "subscriptionType")
+ALLOWED_SUBSCRIPTIONS = ("max", "pro", "team", "enterprise")
+ACTIVE_VAR = "CLAUDE_WORKER_ACTIVE"
+AUTH_TIMEOUT = 60
+KILL_GRACE = 5
+HEARTBEAT = 60
+RESULT_TEXT_LIMIT = 20000
+GLOBAL_INSTRUCTIONS_LIMIT = 200000
+
+EXIT_CODES = {
+    "succeeded": 0,
+    "error": 1,
+    "usage": 2,
+    "auth_failed": 3,
+    "model_error": 4,
+    "denied": 5,
+    "invalid_json": 6,
+    "timeout": 7,
+    "cancelled": 8,
+    "busy": 9,
+    "process_error": 10,
+    "invalid_job": 11,
+    "session_mismatch": 12,
+}
+
+# Rules naming these programs would grant a general shell or recursion.
+SHELL_PROGRAMS = {
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "env", "sudo", "doas",
+    "su", "eval", "exec", "command", "builtin", "xargs", "nohup", "source", ".",
+    "time", "nice", "timeout", "watch", "script", "open",
+}
+RECURSIVE_PROGRAMS = {"claude", "claude-worker", "codex"}
+INTERPRETERS = {"python", "node", "perl", "ruby", "php", "osascript", "lua", "deno", "bun"}
+# The only options allowed before an interpreter's script/module: no value, no inline code. Any other
+# option is rejected, since its value could pass for the script name (e.g. 'python3 -W ignore *').
+PYTHON_PLAIN_LETTERS = set("bBdEIOPqRsSuv")
+NODE_PLAIN_FLAGS = {"--test", "--no-warnings", "--trace-warnings", "--enable-source-maps"}
+INTERPRETER_EVAL_SUBCOMMANDS = {"eval", "repl"}
+PYTHON_MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]]*")
+SHELL_METACHARS = re.compile(r"[;&|`$<>\\]")
+
+
+class WorkerError(Exception):
+    def __init__(self, kind, message, **extra):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.extra = extra
+
+
+class Cancelled(Exception):
+    def __init__(self, signum):
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
+# ---------------------------------------------------------------- utilities
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def progress(message):
+    print(f"claude-worker: {message}", file=sys.stderr, flush=True)
+
+
+def private_dir(path):
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def private_open(path, flags=os.O_WRONLY | os.O_CREAT | os.O_TRUNC):
+    fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)
+    return fd
+
+
+def write_private(path, text):
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    with os.fdopen(private_open(tmp), "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def write_json(path, data):
+    write_private(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def scrubbed_env():
+    """Inherited environment minus API keys, OAuth tokens, and provider switches."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not (key.startswith("ANTHROPIC_") or key.startswith("CLAUDE_CODE_USE_")
+                or key == "CLAUDE_CODE_OAUTH_TOKEN")
+    }
+    env[ACTIVE_VAR] = "1"
+    return env
+
+
+def resolve_claude_bin(value):
+    candidate = value or (DEFAULT_CLAUDE if Path(DEFAULT_CLAUDE).exists() else shutil.which("claude"))
+    if not candidate:
+        raise WorkerError("usage", "Claude CLI not found; pass --claude-bin PATH")
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        found = shutil.which(str(path))
+        if not found:
+            raise WorkerError("usage", f"Claude CLI not found on PATH: {candidate}")
+        path = Path(found)
+    path = Path(os.path.abspath(path))
+    if not (path.is_file() and os.access(path, os.X_OK)):
+        raise WorkerError("usage", f"Claude CLI is not an executable file: {path}")
+    if path.resolve() == Path(__file__).resolve():
+        raise WorkerError("usage", "--claude-bin must not point at claude-worker itself")
+    return str(path)
+
+
+def protected_location(path):
+    """True for the filesystem root, the home directory, or any ancestor of home."""
+    home = Path.home().resolve()
+    return path == Path(path.anchor) or path == home or path in home.parents
+
+
+def canonical_cwd(value):
+    try:
+        path = Path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WorkerError("usage", f"--cwd does not exist: {value} ({exc.__class__.__name__})")
+    if not path.is_dir():
+        raise WorkerError("usage", f"--cwd is not a directory: {path}")
+    if protected_location(path):
+        raise WorkerError(
+            "usage", f"Refusing to run in {path}: filesystem root and home (or its ancestors) "
+                     "are not execution targets; pass the specific project folder")
+    return str(path)
+
+
+def state_root_path(value):
+    """Canonical state root; never root/home/ancestors, which private_dir would chmod 0700."""
+    path = (Path(value).expanduser() if value else default_state_root()).resolve()
+    if protected_location(path):
+        raise WorkerError("usage", f"Refusing to use {path} as --state-dir: filesystem root and home "
+                                   "(or its ancestors) would be made private; pass a dedicated directory")
+    return path
+
+
+def validate_model(value):
+    if not isinstance(value, str) or not MODEL_NAME.fullmatch(value):
+        raise WorkerError("usage", f"Invalid model value: {value!r}")
+    return value
+
+
+def validate_command_rule(rule):
+    """Return a normalized Bash(...) rule body, or raise for blanket/shell rules."""
+    body = rule.strip()
+    if not body or any(ch in body for ch in "\n\r\0"):
+        raise WorkerError("usage", f"Empty or multi-line --allow-command rule: {rule!r}")
+    if "(" in body or ")" in body:
+        raise WorkerError("usage", f"Give only the content of Bash(...), e.g. 'python3 -m unittest *': {rule!r}")
+    if SHELL_METACHARS.search(body):
+        raise WorkerError("usage", f"Shell operators/expansions are not allowed in command rules: {rule!r}")
+    tokens = body.split()
+    head = tokens[0]
+    name = os.path.basename(head)
+    if "*" in head or head.startswith(":"):
+        raise WorkerError("usage", f"Blanket wildcard command rule rejected: {rule!r}")
+    if name in SHELL_PROGRAMS:
+        raise WorkerError("usage", f"Shell/wrapper command rule rejected (grants a general shell): {rule!r}")
+    if name in RECURSIVE_PROGRAMS:
+        raise WorkerError("usage", f"Recursive agent launch rule rejected: {rule!r}")
+    interpreter = "python" if re.fullmatch(r"python(\d+(\.\d+)?)?", name) else name
+    if interpreter in INTERPRETERS:
+        check_interpreter_rule(interpreter, tokens[1:], rule)
+    return " ".join(tokens)
+
+
+def check_interpreter_rule(interpreter, rest, rule):
+    """Interpreter rules must name a script (or a Python -m module) before any wildcard."""
+    def reject(reason):
+        raise WorkerError("usage", f"Interpreter rule {rule!r} rejected: {reason}. Name a specific script "
+                                   "or module, e.g. 'python3 -m unittest *'")
+    for index, token in enumerate(rest):
+        if "*" in token:
+            reject("wildcard before the script/module name")
+        if not token.startswith("-"):
+            if token in INTERPRETER_EVAL_SUBCOMMANDS:
+                reject("inline or interactive code")
+            return
+        if interpreter == "python" and token == "-m":
+            module = rest[index + 1] if index + 1 < len(rest) else ""
+            if not PYTHON_MODULE.fullmatch(module):
+                reject("-m must be written separately and followed by a named module")
+            return
+        if interpreter == "python" and len(token) > 1 and set(token[1:]) <= PYTHON_PLAIN_LETTERS:
+            continue
+        if interpreter == "node" and token in NODE_PLAIN_FLAGS:
+            continue
+        reject(f"option {token!r} may take a value or run inline/stdin code")
+    if interpreter == "node" and "--test" in rest:
+        return
+    reject("no script or module named")
+
+
+def read_brief(value):
+    path = Path(value).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkerError("usage", f"Cannot read brief {path}: {exc}")
+    if not text.strip():
+        raise WorkerError("usage", f"Brief is empty: {path}")
+    return text
+
+
+def default_state_root():
+    return Path.home() / ".local" / "state" / "claude-worker"
+
+
+# ---------------------------------------------------------------- auth
+
+def check_auth(claude_bin, env):
+    """Return redacted auth metadata; raise WorkerError unless subscription auth."""
+    try:
+        proc = subprocess.run(
+            [claude_bin, "auth", "status", "--json"], env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=AUTH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise WorkerError("auth_failed", f"'claude auth status' timed out after {AUTH_TIMEOUT}s")
+    except OSError as exc:
+        raise WorkerError("auth_failed", f"Cannot execute {claude_bin}: {exc}")
+    try:
+        data = json.loads(proc.stdout)
+        if not isinstance(data, dict):
+            raise ValueError
+    except ValueError:
+        # Raw output is not echoed: it may contain identity details.
+        raise WorkerError("auth_failed", f"'claude auth status --json' returned no JSON object (exit {proc.returncode})")
+    auth = {}
+    for field in AUTH_FIELDS:
+        value = data.get(field)
+        auth[field] = value if isinstance(value, (bool, str)) or value is None else None
+    problems = auth_problems(auth)
+    if proc.returncode != 0:
+        problems.insert(0, f"'claude auth status' exited {proc.returncode}")
+    return auth, problems
+
+
+def auth_problems(auth):
+    problems = []
+    if auth["loggedIn"] is not True:
+        problems.append("not logged in")
+    if auth["authMethod"] != "claude.ai":
+        problems.append(f"authMethod is {auth['authMethod']!r}, need 'claude.ai' subscription login")
+    if auth["apiProvider"] != "firstParty":
+        problems.append(f"apiProvider is {auth['apiProvider']!r}, need 'firstParty'")
+    if auth["subscriptionType"] not in ALLOWED_SUBSCRIPTIONS:
+        problems.append(f"subscriptionType is {auth['subscriptionType']!r}, need one of {list(ALLOWED_SUBSCRIPTIONS)}")
+    return problems
+
+
+def require_auth(claude_bin, env):
+    auth, problems = check_auth(claude_bin, env)
+    if problems:
+        raise WorkerError(
+            "auth_failed",
+            "Subscription auth required (no API fallback): " + "; ".join(problems)
+            + ". Run 'claude auth login' with your Claude.ai account in a terminal, then retry.",
+            auth=auth)
+    progress(f"auth ok ({auth['subscriptionType']} subscription)")
+    return auth
+
+
+# ---------------------------------------------------------------- locking
+
+class CwdLock:
+    """Nonblocking advisory flock per canonical cwd, in one per-user namespace whatever --state-dir is.
+
+    The Claude child inherits the descriptor, so the lock outlives a hard-killed launcher until that
+    child (or a descendant still holding the descriptor) exits. It does not stop or reap the child.
+    """
+
+    def __init__(self, cwd):
+        digest = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:32]
+        self.path = private_dir(private_dir(default_state_root()) / "locks") / f"{digest}.lock"
+        self.cwd = cwd
+        self.fd = None
+
+    def acquire(self, job_dir=None):
+        fd = private_open(self.path, os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                holder = json.loads(os.read(fd, 4096) or b"{}")
+            except ValueError:
+                holder = {}
+            os.close(fd)
+            raise WorkerError(
+                "busy", f"Another claude-worker job holds the lock for {self.cwd}. Wait for it, or "
+                        "isolate concurrent edits in a separate worktree/folder.",
+                lock_path=str(self.path), holder_pid=holder.get("pid"), holder_job=holder.get("job_dir"))
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"pid": os.getpid(), "cwd": self.cwd, "job_dir": job_dir,
+                                 "since": now()}).encode("utf-8"))
+        self.fd = fd
+
+    def set_job(self, job_dir):
+        os.ftruncate(self.fd, 0)
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.write(self.fd, json.dumps({"pid": os.getpid(), "cwd": self.cwd, "job_dir": job_dir,
+                                      "since": now()}).encode("utf-8"))
+
+    def release(self):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+    def is_held(self):
+        if not self.path.exists():
+            return False
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+
+# ---------------------------------------------------------------- claude invocation
+
+def worker_contract(mode):
+    global_md = Path.home() / ".claude" / "CLAUDE.md"
+    lines = [
+        "# claude-worker contract",
+        "You are a delegated worker launched by claude-worker for a primary agent or caller, which will review your work.",
+        "Safe mode is on: CLAUDE.md, memory, hooks, plugins, skills, and MCP servers were NOT loaded automatically.",
+    ]
+    if mode == "text":
+        lines.append("You have no tools. Project CLAUDE.md/AGENTS.md instructions relevant to this task are only "
+                     "available if the brief includes them.")
+    else:
+        lines.append(f"Before starting, read the user's global instructions at {global_md} if it exists, plus any "
+                     "project CLAUDE.md/AGENTS.md files the brief references or that exist in the working directory "
+                     "root, and follow them where they do not conflict with the brief.")
+        lines.append("You own the whole assigned outcome, including the research and checks it needs; don't hand "
+                     "steps back that your tools can do. Native subagents (Agent tool) are available for "
+                     "independent or bulky research and reading: give each an explicit model and verify what "
+                     "they return before relying on it.")
+    lines += [
+        "The brief is your complete authorization and defines scope; do not expand it. You do not have the primary "
+        "agent's conversation history, connectors, or credentials. Do not guess at missing context; report it.",
+        "When file tools are available, use Read/Glob/Grep/Edit/Write for file work. Do not replace them with "
+        "shell file edits, inline Python, or temporary files outside the assigned scope. Run a preapproved "
+        "command exactly as given, in a separate Bash call: do not add cd, chmod, pipelines, redirection, "
+        "shell joins, or output-formatting commands. Report its ordinary output.",
+        "Tool permissions are fixed. If an action is denied, do not work around it; stop and report what you needed.",
+        "Do not launch claude, claude-worker, codex, or other agent CLIs.",
+        "Finish with a report whose first line is exactly one of `STATUS: complete`, `STATUS: partial`, or "
+        "`STATUS: blocked`, followed by: changed files/artifacts; checks actually run and their outcomes; "
+        "assumptions/deviations; unresolved risks. Keep evidence inspectable (paths, commands, outputs).",
+    ]
+    if mode == "text" and global_md.is_file():
+        content = global_md.read_text(encoding="utf-8", errors="replace")[:GLOBAL_INSTRUCTIONS_LIMIT]
+        lines += ["", f"## User global instructions ({global_md})", content]
+    return "\n".join(lines) + "\n"
+
+
+def check_mode_commands(mode, rules):
+    if mode == "text" and rules:
+        raise WorkerError("usage", "Text mode is tool-free; --allow-command requires --mode read or edit")
+
+
+def build_argv(claude_bin, job, contract, session_id, resume):
+    check_mode_commands(job["mode"], job["allow_commands"])
+    spec = MODES[job["mode"]]
+    tools = list(spec["tools"])
+    allowed = list(spec["tools"])
+    if job["allow_commands"]:
+        tools.append("Bash")
+        allowed += [f"Bash({rule})" for rule in job["allow_commands"]]
+    argv = [
+        claude_bin, "--print", "--output-format", "json",
+        "--model", job["model"], "--effort", job["effort"],
+        "--safe-mode", "--setting-sources", "",
+        "--settings", json.dumps({"disableAllHooks": True}),
+        "--strict-mcp-config", "--mcp-config", json.dumps({"mcpServers": {}}),
+        "--permission-prompts", "none",
+        "--permission-mode", spec["permission_mode"],
+        "--tools", ",".join(tools),
+    ]
+    if allowed:
+        argv += ["--allowedTools", *allowed]
+    argv += ["--append-system-prompt", contract]
+    argv += ["--resume", session_id] if resume else ["--session-id", session_id]
+    return argv
+
+
+def reap_group(pgid):
+    """SIGTERM then SIGKILL anything left in the process group."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.monotonic() + KILL_GRACE
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return
+            time.sleep(0.05)
+
+
+class SignalGuard:
+    """Turn SIGINT/SIGTERM/SIGHUP into cancellation.
+
+    Once a child is about to start, signals are only recorded: supervise() acts on them while the child
+    runs, and afterwards the command finishes persisting and reporting the attempt without interruption.
+    """
+
+    SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def __init__(self):
+        self.signum = None
+        self.supervising = False
+        self.previous = {}
+
+    def __enter__(self):
+        for sig in self.SIGNALS:
+            self.previous[sig] = signal.signal(sig, self._handle)
+        return self
+
+    def __exit__(self, *exc):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+
+    def _handle(self, signum, frame):
+        self.signum = signum
+        if not self.supervising:
+            raise Cancelled(signum)
+
+
+def supervise(proc, timeout, guard):
+    """Wait for proc; return 'exited', 'timeout', or 'cancelled'. Always reaps the group."""
+    deadline = time.monotonic() + timeout
+    next_beat = time.monotonic() + HEARTBEAT
+    started = time.monotonic()
+    outcome = "exited"
+    guard.supervising = True
+    try:
+        while True:
+            if guard.signum is not None:
+                outcome = "cancelled"
+                break
+            try:
+                proc.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if time.monotonic() >= deadline:
+                outcome = "timeout"
+                break
+            if time.monotonic() >= next_beat:
+                progress(f"still running ({int(time.monotonic() - started)}s)")
+                next_beat += HEARTBEAT
+    finally:
+        reap_group(proc.pid)
+        try:
+            proc.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    return outcome
+
+
+def parse_result(stdout_text):
+    try:
+        data = json.loads(stdout_text)
+    except ValueError:
+        return None
+    if isinstance(data, list):
+        results = [item for item in data if isinstance(item, dict) and item.get("type") == "result"]
+        return results[-1] if results else None
+    if isinstance(data, dict) and (data.get("type") == "result" or "subtype" in data):
+        return data
+    return None
+
+
+def summarize_denials(denials):
+    summary = []
+    for denial in denials if isinstance(denials, list) else []:
+        if not isinstance(denial, dict):
+            continue
+        tool_input = denial.get("tool_input") if isinstance(denial.get("tool_input"), dict) else {}
+        target = tool_input.get("command") or tool_input.get("file_path") or tool_input.get("pattern")
+        summary.append({"tool_name": denial.get("tool_name"), "target": str(target)[:300] if target else None})
+    return summary
+
+
+def worker_reported_status(text):
+    match = re.search(r"^\s*\**STATUS:\s*(complete|partial|blocked)\b", text or "", re.IGNORECASE | re.MULTILINE)
+    return match.group(1).lower() if match else "unreported"
+
+
+def classify(outcome, returncode, result, timeout, session_id, reported_session):
+    if outcome == "timeout":
+        return "timeout", f"Timed out after {timeout}s; the Claude process group was terminated."
+    if outcome == "cancelled":
+        return "cancelled", "Cancelled by signal; the Claude process group was terminated."
+    if result is None:
+        return "invalid_json", f"Claude did not return a JSON result (exit {returncode}); see stderr.log/stdout.json."
+    if result.get("is_error") or result.get("subtype") != "success":
+        return "model_error", f"Claude reported an error (subtype={result.get('subtype')!r}); see result.md/stderr.log."
+    if reported_session is not None and reported_session != session_id:
+        return "session_mismatch", (f"Claude reported session {reported_session} instead of {session_id}, so this "
+                                    "is not a same-session continuation. The job keeps the original id; inspect "
+                                    "the attempt artifacts before resuming, or start a new run.")
+    if result.get("permission_denials"):
+        return "denied", ("Worker hit permission denials. Permissions are not expanded automatically: decide "
+                          "whether a specific --allow-command rule is warranted, or do that step yourself.")
+    if returncode != 0:
+        return "process_error", f"Claude returned a success result but exited {returncode}; see stderr.log."
+    return "succeeded", "Claude process finished cleanly. This is not acceptance: review changes and rerun checks."
+
+
+def run_attempt(job, brief_text, claude_bin, timeout, resume, auth, env, guard, lock):
+    job_dir = Path(job["job_dir"])
+    private_dir(job_dir / "attempts")
+    number = len(job["attempts"]) + 1
+    while (job_dir / "attempts" / f"{number:03d}").exists():  # never reuse an attempt directory
+        number += 1
+    adir = job_dir / "attempts" / f"{number:03d}"
+    adir.mkdir(mode=0o700)
+    artifacts = {name: str(adir / name) for name in
+                 ("brief.md", "system-prompt.md", "argv.json", "auth.json", "stdout.json", "stderr.log",
+                  "result.md", "attempt.json")}
+    write_private(adir / "brief.md", brief_text)
+    contract = worker_contract(job["mode"])
+    write_private(adir / "system-prompt.md", contract)
+    session_id = job["session_id"] if resume else str(uuid.uuid4())
+    argv = build_argv(claude_bin, job, contract, session_id, resume)
+    shown = [("<system-prompt.md>" if arg == contract else arg) for arg in argv]
+    write_json(adir / "argv.json", shown)
+    write_json(adir / "auth.json", auth)
+
+    record = {"attempt": number, "kind": "resume" if resume else "run", "started_at": now(),
+              "status": "running", "timeout": timeout, "claude_bin": claude_bin,
+              "requested_session_id": session_id, "artifacts": artifacts}
+    job["attempts"].append(record)
+    job["status"] = "running"
+    if not resume:
+        job["session_id"] = session_id
+    save_job(job)
+
+    stdout_fd = private_open(adir / "stdout.json")
+    stderr_fd = private_open(adir / "stderr.log")
+    started = time.monotonic()
+    # From here to the end of the command, signals are deferred: a started child is always reaped by
+    # supervise(), and the final attempt metadata is always persisted.
+    guard.supervising = True
+    try:
+        with open(adir / "brief.md", "rb") as stdin:
+            # The child inherits the lock descriptor, so a SIGKILLed launcher cannot free the folder
+            # while Claude may still be editing it.
+            proc = subprocess.Popen(argv, cwd=job["cwd"], env=env, stdin=stdin, stdout=stdout_fd,
+                                    stderr=stderr_fd, start_new_session=True, pass_fds=(lock.fd,))
+    except OSError as exc:
+        record.update(status="process_error", finished_at=now(), message=f"Cannot start Claude: {exc}")
+        finish_attempt(job, record, adir)
+        return record, ""
+    finally:
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+    # Saved while running so a parent can find (and end) the group if this launcher is killed hard.
+    identity = {"launcher_pid": os.getpid(), "pid": proc.pid, "pgid": proc.pid}
+    record["process"] = dict(identity)
+    try:
+        save_job(job)
+        progress(f"attempt {number} started (pid {proc.pid}, mode {job['mode']}, model {job['model']}, timeout {timeout}s)")
+    except BaseException:
+        reap_group(proc.pid)
+        proc.wait()
+        raise
+    outcome = supervise(proc, timeout, guard)
+
+    stdout_text = (adir / "stdout.json").read_text(encoding="utf-8", errors="replace")
+    result = parse_result(stdout_text)
+    reported_session = result.get("session_id") if result else None
+    if not (isinstance(reported_session, str) and reported_session):
+        reported_session = None
+    # The stored session id never changes after the first attempt; an unexpected id stays on this attempt.
+    status, message = classify(outcome, proc.returncode, result, timeout, session_id, reported_session)
+    if reported_session == session_id:
+        job["session_confirmed"] = True
+    result_text = ""
+    if result is not None and isinstance(result.get("result"), str):
+        result_text = result["result"]
+    write_private(adir / "result.md", result_text)
+    model_usage = result.get("modelUsage") if result else None
+    record.update(
+        status=status, message=message, finished_at=now(),
+        duration_s=round(time.monotonic() - started, 2),
+        process={**identity, "outcome": outcome, "returncode": proc.returncode,
+                 "signal": signal.Signals(guard.signum).name if outcome == "cancelled" else None},
+        session_id=job["session_id"], reported_session_id=reported_session,
+        is_error=result.get("is_error") if result else None,
+        subtype=result.get("subtype") if result else None,
+        permission_denials=summarize_denials(result.get("permission_denials")) if result else [],
+        models_used=sorted(model_usage) if isinstance(model_usage, dict) else [],
+        worker_reported_status=worker_reported_status(result_text),
+    )
+    finish_attempt(job, record, adir)
+    progress(f"attempt {number} {status}")
+    return record, result_text
+
+
+def finish_attempt(job, record, adir):
+    write_json(adir / "attempt.json", record)
+    job["status"] = record["status"]
+    job["updated_at"] = now()
+    save_job(job)
+
+
+def save_job(job):
+    write_json(Path(job["job_dir"]) / "job.json", job)
+
+
+def attempt_output(command, job, record, result_text):
+    text = result_text or ""
+    status = record["status"]
+    output = {
+        "ok": status == "succeeded",
+        "command": command,
+        "status": status,
+        "exit_code": EXIT_CODES[status],
+        "message": record["message"],
+        "job_id": job["job_id"],
+        "job_dir": job["job_dir"],
+        "attempt": record["attempt"],
+        "session_id": job["session_id"],
+        "reported_session_id": record.get("reported_session_id"),
+        "cwd": job["cwd"],
+        "mode": job["mode"],
+        "model": job["model"],
+        "effort": job["effort"],
+        "process": record.get("process"),
+        "is_error": record.get("is_error"),
+        "subtype": record.get("subtype"),
+        "permission_denials": record.get("permission_denials", []),
+        "models_used": record.get("models_used", []),
+        "worker_reported_status": record.get("worker_reported_status", "unreported"),
+        "primary_acceptance": "pending: the primary agent must inspect changes/artifacts and rerun checks",
+        "result_text": text[:RESULT_TEXT_LIMIT],
+        "result_truncated": len(text) > RESULT_TEXT_LIMIT,
+        "artifacts": record["artifacts"],
+        "resume_command": shlex.join([str(Path(__file__).resolve()), "resume", job["job_dir"], "--brief", "FILE"]),
+    }
+    return output
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_run(args, guard):
+    if os.environ.get(ACTIVE_VAR):
+        raise WorkerError("usage", "Refusing to launch claude-worker from inside a claude-worker job")
+    cwd = canonical_cwd(args.cwd)
+    brief_text = read_brief(args.brief)
+    validate_model(args.model)
+    if args.timeout <= 0:
+        raise WorkerError("usage", "--timeout must be positive")
+    rules = [validate_command_rule(rule) for rule in args.allow_command or []]
+    check_mode_commands(args.mode, rules)
+    claude_bin = resolve_claude_bin(args.claude_bin)
+    state_root = state_root_path(args.state_dir)
+    private_dir(state_root)
+    jobs_root = private_dir(state_root / "jobs")
+    env = scrubbed_env()
+
+    lock = CwdLock(cwd)
+    lock.acquire()
+    try:
+        auth = require_auth(claude_bin, env)
+        job_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+        job_dir = jobs_root / job_id
+        job_dir.mkdir(mode=0o700)
+        CONTEXT["job_dir"] = str(job_dir)
+        lock.set_job(str(job_dir))
+        write_private(job_dir / "brief.md", brief_text)
+        job = {
+            "schema": SCHEMA, "job_id": job_id, "job_dir": str(job_dir), "state_root": str(state_root),
+            "created_at": now(), "updated_at": now(), "cwd": cwd, "model": args.model,
+            "effort": args.effort, "mode": args.mode, "allow_commands": rules, "timeout": args.timeout,
+            "claude_bin": claude_bin, "session_id": None, "session_confirmed": False,
+            "lock_path": str(lock.path), "auth": auth,
+            "status": "created", "attempts": [],
+        }
+        save_job(job)
+        progress(f"job {job_dir}")
+        record, result_text = run_attempt(job, brief_text, claude_bin, args.timeout, False, auth, env, guard, lock)
+    finally:
+        lock.release()
+    return attempt_output("run", job, record, result_text)
+
+
+def load_job(job_dir_arg):
+    """Load job.json and validate every field later used for cwd, tools, session, or state."""
+    job_dir = Path(job_dir_arg).expanduser().resolve()
+    CONTEXT["job_dir"] = str(job_dir)
+    path = job_dir / "job.json"
+
+    def invalid(detail):
+        raise WorkerError("invalid_job", f"Job metadata {path} is unusable: {detail}. Inspect the retained "
+                                         "artifacts manually or start a new run.")
+
+    if not path.is_file():
+        raise WorkerError("invalid_job", f"Not a claude-worker job directory (no job.json): {job_dir}")
+    try:
+        job = read_json(path)
+    except (ValueError, UnicodeDecodeError) as exc:
+        invalid(f"malformed JSON ({exc.__class__.__name__})")
+    if not isinstance(job, dict) or job.get("schema") != SCHEMA:
+        invalid(f"not a schema-{SCHEMA} job object")
+    for field in ("job_id", "cwd", "state_root", "claude_bin", "status"):
+        if not isinstance(job.get(field), str) or not job[field]:
+            invalid(f"{field!r} missing or not a string")
+    if job.get("mode") not in MODES:
+        invalid(f"unknown mode {job.get('mode')!r}")
+    if job.get("effort") not in EFFORTS:
+        invalid(f"unknown effort {job.get('effort')!r}")
+    if not isinstance(job.get("model"), str) or not MODEL_NAME.fullmatch(job["model"]):
+        invalid("invalid model")
+    timeout = job.get("timeout")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        invalid("invalid timeout")
+    if job.get("session_id") is not None and (not isinstance(job["session_id"], str) or not job["session_id"]):
+        invalid("invalid session_id")
+    attempts = job.get("attempts")
+    if not isinstance(attempts, list) or not all(isinstance(a, dict) for a in attempts):
+        invalid("attempts is not a list of objects")
+    rules = job.get("allow_commands")
+    if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
+        invalid("allow_commands is not a list of strings")
+    for rule in rules:
+        try:
+            if validate_command_rule(rule) != rule:
+                raise WorkerError("usage", f"rule {rule!r} is not normalized")
+        except WorkerError as exc:
+            invalid(f"command rule rejected ({exc.message})")
+    if job["mode"] == "text" and rules:
+        invalid("text mode job carries command rules")
+    state_root = Path(job["state_root"]).resolve()
+    if job_dir.parent.name != "jobs" or job_dir.parent.parent != state_root or protected_location(state_root):
+        invalid("state_root does not contain this job directory")
+    job["job_dir"] = str(job_dir)
+    return job
+
+
+def cmd_resume(args, guard):
+    if os.environ.get(ACTIVE_VAR):
+        raise WorkerError("usage", "Refusing to launch claude-worker from inside a claude-worker job")
+    job = load_job(args.job_dir)
+    brief_text = read_brief(args.brief)
+    if not job.get("session_id"):
+        raise WorkerError("usage", "Job has no session id to resume; start a new run instead")
+    cwd = canonical_cwd(job["cwd"])
+    if cwd != job["cwd"]:
+        raise WorkerError("usage", f"Job cwd {job['cwd']} now resolves to {cwd}; refusing to resume elsewhere")
+    timeout = args.timeout if args.timeout is not None else job["timeout"]
+    if timeout <= 0:
+        raise WorkerError("usage", "--timeout must be positive")
+    claude_bin = resolve_claude_bin(args.claude_bin or job["claude_bin"])
+    env = scrubbed_env()
+    lock = CwdLock(cwd)
+    lock.acquire(job["job_dir"])
+    try:
+        auth = require_auth(claude_bin, env)
+        job["auth"] = auth
+        record, result_text = run_attempt(job, brief_text, claude_bin, timeout, True, auth, env, guard, lock)
+    finally:
+        lock.release()
+    return attempt_output("resume", job, record, result_text)
+
+
+def cmd_status(args, guard):
+    job = load_job(args.job_dir)
+    held = CwdLock(job["cwd"]).is_held()
+    status = job["status"]
+    if status == "running" and not held:
+        status = "interrupted"
+    attempts = [{key: attempt.get(key) for key in
+                 ("attempt", "kind", "status", "message", "started_at", "finished_at", "duration_s",
+                  "session_id", "reported_session_id", "worker_reported_status", "permission_denials",
+                  "models_used", "process")}
+                for attempt in job["attempts"]]
+    last = job["attempts"][-1] if job["attempts"] else {}
+    return {
+        "ok": True, "command": "status", "status": status, "lock_held": held,
+        "job_id": job["job_id"], "job_dir": job["job_dir"], "cwd": job["cwd"], "mode": job["mode"],
+        "model": job["model"], "effort": job["effort"], "allow_commands": job["allow_commands"],
+        "session_id": job["session_id"], "session_confirmed": job.get("session_confirmed", False),
+        "auth": job.get("auth"), "attempts": attempts,
+        "latest_artifacts": last.get("artifacts"),
+        "primary_acceptance": "not tracked by claude-worker; decided by the primary agent's review",
+    }
+
+
+def cmd_auth(args, guard):
+    claude_bin = resolve_claude_bin(args.claude_bin)
+    auth, problems = check_auth(claude_bin, scrubbed_env())
+    if problems:
+        raise WorkerError("auth_failed", "Subscription auth not usable: " + "; ".join(problems), auth=auth)
+    return {"ok": True, "command": "auth", "status": "succeeded", "auth": auth, "claude_bin": claude_bin}
+
+
+# ---------------------------------------------------------------- entrypoint
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise WorkerError("usage", f"{self.prog}: {message}")
+
+
+def build_parser():
+    parser = Parser(prog="claude-worker", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
+
+    run = sub.add_parser("run", help="start a new worker job")
+    run.add_argument("--cwd", required=True)
+    run.add_argument("--brief", required=True)
+    run.add_argument("--model", required=True)
+    run.add_argument("--effort", required=True, choices=EFFORTS)
+    run.add_argument("--mode", required=True, choices=sorted(MODES))
+    run.add_argument("--timeout", required=True, type=int)
+    run.add_argument("--allow-command", action="append", metavar="RULE",
+                     help="content of a Bash(...) rule, e.g. 'python3 -m unittest *'")
+    run.add_argument("--state-dir")
+    run.add_argument("--claude-bin")
+
+    resume = sub.add_parser("resume", help="continue a job's Claude session with a new brief")
+    resume.add_argument("job_dir")
+    resume.add_argument("--brief", required=True)
+    resume.add_argument("--timeout", type=int)
+    resume.add_argument("--claude-bin")
+
+    status = sub.add_parser("status", help="summarize saved job state (no model calls)")
+    status.add_argument("job_dir")
+
+    auth = sub.add_parser("auth", help="check subscription auth (redacted)")
+    auth.add_argument("--claude-bin")
+    return parser
+
+
+COMMANDS = {"run": cmd_run, "resume": cmd_resume, "status": cmd_status, "auth": cmd_auth}
+CONTEXT = {}  # artifact locations to report even when a command fails part-way
+
+
+def main(argv=None):
+    command = None
+    CONTEXT.clear()
+    with SignalGuard() as guard:
+        try:
+            args = build_parser().parse_args(argv)
+            command = args.command
+            output = COMMANDS[command](args, guard)
+        except WorkerError as exc:
+            output = {"ok": False, "command": command, "status": exc.kind, "exit_code": EXIT_CODES[exc.kind],
+                      "message": exc.message, **exc.extra}
+        except (Cancelled, KeyboardInterrupt):
+            output = {"ok": False, "command": command, "status": "cancelled",
+                      "exit_code": EXIT_CODES["cancelled"], "message": "Cancelled before the model process started"}
+        except OSError as exc:
+            where = f" ({exc.filename})" if exc.filename else ""
+            output = {"ok": False, "command": command, "status": "error", "exit_code": EXIT_CODES["error"],
+                      "message": f"Filesystem error: {exc.strerror or exc}{where}. Check paths and permissions."}
+        except Exception as exc:  # keep stdout machine-readable even on unexpected failures
+            output = {"ok": False, "command": command, "status": "error", "exit_code": EXIT_CODES["error"],
+                      "message": f"Unexpected {exc.__class__.__name__}: {exc}"}
+    if not output.get("ok"):
+        for key, value in CONTEXT.items():
+            output.setdefault(key, value)
+    output.setdefault("exit_code", EXIT_CODES["succeeded"] if output.get("ok") else EXIT_CODES["error"])
+    print(json.dumps(output, indent=2))
+    if not output["ok"]:
+        progress(f"{output['status']}: {output['message']}")
+    return output["exit_code"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
