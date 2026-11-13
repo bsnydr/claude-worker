@@ -1,5 +1,7 @@
 # claude-worker
 
+[![tests](https://github.com/bsnydr/claude-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/bsnydr/claude-worker/actions/workflows/ci.yml)
+
 A single-file Python launcher that runs one bounded, non-interactive
 [Claude Code](https://docs.claude.com/en/docs/claude-code) job from a script or
 another coding agent, and reports the outcome as one JSON object.
@@ -32,10 +34,8 @@ jobs edit the same folder at once, and where the transcript and result go.
 - macOS or Linux. The launcher uses `fcntl` file locking and POSIX process
   groups, so **Windows is not supported**.
 - Python 3.12 or newer, standard library only. This is a conservative support floor,
-  not a claim that the language syntax requires it. CI is configured for Python 3.12
-  and 3.14 on Ubuntu and macOS. At this edition's review on 21 October 2026, no
-  remote matrix result had been verified; check the repository's Actions tab for
-  current results. Local verification was on macOS with Python 3.14.6 only.
+  not a claim that the language syntax requires it. CI runs Python 3.12 and 3.14 on
+  Ubuntu and macOS; see [Offline tests](#offline-tests) for the dated result.
 - For real use only: an installed, logged-in
   [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI. The launcher passes
   flags such as `--safe-mode`, `--permission-prompts` and `--setting-sources`; it
@@ -61,6 +61,33 @@ if it exists (the default Homebrew location on Apple Silicon); otherwise the fir
 `claude` on `PATH`.
 
 ## Usage
+
+### First run: a tiny read-only job
+
+This needs the Claude Code CLI installed and logged in with a `claude.ai` subscription
+(`claude auth login`); it makes a real model call under your account. It works in a new
+temporary folder, so nothing existing is overwritten.
+
+```sh
+demo_root="$(mktemp -d)"
+mkdir "$demo_root/work" "$demo_root/state"
+printf 'Cueframe turns audio and cues into animation.\n' > "$demo_root/work/notes.txt"
+cat > "$demo_root/brief.md" <<'EOF'
+# Task: summarise one file
+Read only `notes.txt` and summarise it in one sentence. Do not change any files.
+Return STATUS: complete on the first line, followed by the one-sentence summary.
+EOF
+
+claude-worker auth
+claude-worker run --cwd "$demo_root/work" --brief "$demo_root/brief.md" \
+  --model sonnet --effort low --mode read --timeout 300 \
+  --state-dir "$demo_root/state"
+```
+
+`--mode read` grants file reads, web research and the Agent tool, but no editing and no
+Bash (there is no `--allow-command` rule). The timeout is five minutes. The JSON result
+reports the job directory; the full text is in `attempts/001/result.md` there. Delete
+`"$demo_root"` when finished. The worker's `STATUS` line is its own claim.
 
 The operational subcommands (`run`, `resume`, `status`, `auth`) print one JSON object
 to stdout, including on failure, and short progress lines to stderr. `--help` prints
@@ -307,10 +334,10 @@ python3 -B -m unittest -v test_claude_worker
 They cover, among others: auth fail-closed cases and secret redaction, environment
 scrubbing, command-rule rejection, folder locking, timeout and process-group cleanup,
 resume with the same session, and rejection of tampered job metadata. The same
-command is configured to run in GitHub Actions on Ubuntu and macOS
-(`.github/workflows/ci.yml`). As of the 21 October 2026 review, no remote matrix
-result had been verified for this edition. Check the Actions tab before assuming
-cross-platform compatibility.
+command runs in GitHub Actions (`.github/workflows/ci.yml`). Checked on 13 November 2026:
+[run 39780772942](https://github.com/bsnydr/claude-worker/actions/runs/39780772942) for
+commit `15d0051` (executed 22 October 2026) passed on Ubuntu and macOS with Python 3.12
+and 3.14. It uses the fake CLI, so it does not show how a real Claude Code installation behaves.
 
 ## Limitations
 
